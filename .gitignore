@@ -1,0 +1,42 @@
+# Flutter/Dart/Pub
+.dart_tool/
+.packages
+.pub-cache/
+build/
+.idea/
+.vscode/
+android/.gradle/
+android/app/build/
+ios/Pods/
+ios/.symlinks/
+linux/build/
+windows/build/
+macos/Pods/
+macos/Flutter/ephemeral/
+web/.dart_tool/
+
+# Environment
+.env
+*.env
+.env.*
+lib/config/keys.dart
+lib/services/chat_service.dart
+
+# Firebase
+google-services.json
+GoogleService-Info.plist
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Generated files
+*.iml
+*.log
+*.lock
+*.tmp
+*.swp
+*.bak
+
+# Project-specific
+assets/database/*.db
