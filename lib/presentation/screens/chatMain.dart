@@ -18,6 +18,7 @@ import 'package:flutter_application_4_geodesica/presentation/providers/themeProv
 import 'package:flutter_application_4_geodesica/presentation/providers/userProvider.dart';
 import 'package:flutter_application_4_geodesica/services/chat_local_service.dart';
 import 'package:flutter_application_4_geodesica/data/database_helper.dart';
+import 'package:url_launcher/url_launcher.dart'; // NUEVO: abre el reporte en el navegador
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({Key? key}) : super(key: key);
@@ -247,6 +248,8 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   // LISTA DE MENSAJES
   // Itera sobre chatProvider.messages y renderiza RichMessage
   // ─────────────────────────────────────────────────────────────
+  // MODIFICADO: pasa onViewOnline y reportPublicUrl al bubble.
+  // El boton "Ver Online" aparece solo cuando el reporte ya tiene URL publica.
   Widget _buildMessageList(bool isDark, ChatProvider chatProvider) {
     final messages = chatProvider.messages;
     return ListView.builder(
@@ -254,13 +257,19 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
       itemCount: messages.length,
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
       itemBuilder: (context, index) {
+        final msg = messages[index];
         return _AnimatedRichBubble(
-          message: messages[index],
+          message: msg,
           isDark: isDark,
           index: index,
-          onExportPdf: () => chatProvider.exportReportToPDF(messages[index].id),
-          onExportExcel:
-              () => chatProvider.exportReportToExcel(messages[index].id),
+          onExportPdf: () => chatProvider.exportReportToPDF(msg.id),
+          onExportExcel: () => chatProvider.exportReportToExcel(msg.id),
+          // NUEVO: null cuando no hay URL publica aun (boton oculto)
+          reportPublicUrl: msg.reportPublicUrl,
+          onViewOnline:
+              msg.reportPublicUrl != null
+                  ? () => _onViewOnline(msg.reportPublicUrl!)
+                  : null,
         );
       },
     );
@@ -385,6 +394,31 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         ],
       ),
     );
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // NUEVO — Abrir reporte en el navegador del dispositivo
+  // Llamado por _buildMessageList cuando el usuario pulsa "Ver Online".
+  // Si el navegador no puede abrirse, copia la URL al portapapeles.
+  // ─────────────────────────────────────────────────────────────
+  Future<void> _onViewOnline(String url) async {
+    final uri = Uri.tryParse(url);
+    if (uri == null) {
+      _showToast('URL inválida', isError: true);
+      return;
+    }
+    try {
+      final puedeAbrir = await canLaunchUrl(uri);
+      if (puedeAbrir) {
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
+      } else {
+        await Clipboard.setData(ClipboardData(text: url));
+        _showToast('URL copiada al portapapeles');
+      }
+    } catch (_) {
+      await Clipboard.setData(ClipboardData(text: url));
+      _showToast('URL copiada: $url');
+    }
   }
 
   Widget _buildLoadingScreen(bool isDark) {
@@ -696,12 +730,16 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
 // Reemplaza _AnimatedMessageBubble del chatMain original.
 // Renderiza texto, gráfica interactiva y botones PDF/Excel.
 // ─────────────────────────────────────────────────────────────────
+// MODIFICADO: se añaden onViewOnline y reportPublicUrl (ambos opcionales
+// para mantener compatibilidad). onViewOnline es null si no hay URL publica.
 class _AnimatedRichBubble extends StatefulWidget {
   final RichMessage message;
   final bool isDark;
   final int index;
   final VoidCallback onExportPdf;
   final VoidCallback onExportExcel;
+  final VoidCallback? onViewOnline; // NUEVO: null = boton no visible
+  final String? reportPublicUrl; // NUEVO: null = sin URL disponible
 
   const _AnimatedRichBubble({
     required this.message,
@@ -709,6 +747,8 @@ class _AnimatedRichBubble extends StatefulWidget {
     required this.index,
     required this.onExportPdf,
     required this.onExportExcel,
+    this.onViewOnline, // opcional
+    this.reportPublicUrl, // opcional
   });
 
   @override
@@ -853,10 +893,13 @@ class _AnimatedRichBubbleState extends State<_AnimatedRichBubble>
                         ],
 
                         // ── Botones de exportación ─────────
+                        // MODIFICADO: Row -> Wrap para soportar 3 botones.
+                        // El boton Ver Online aparece solo con URL publica.
                         if (isReport) ...[
                           const SizedBox(height: 12),
-                          Row(
-                            mainAxisSize: MainAxisSize.min,
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 6,
                             children: [
                               _ExportButton(
                                 icon: Icons.picture_as_pdf_rounded,
@@ -864,15 +907,32 @@ class _AnimatedRichBubbleState extends State<_AnimatedRichBubble>
                                 color: const Color(0xFFD32F2F),
                                 onPressed: widget.onExportPdf,
                               ),
-                              const SizedBox(width: 8),
                               _ExportButton(
                                 icon: Icons.table_chart_rounded,
                                 label: 'Excel',
                                 color: const Color(0xFF388E3C),
                                 onPressed: widget.onExportExcel,
                               ),
+                              // NUEVO: solo visible cuando hay URL publica
+                              if (widget.onViewOnline != null)
+                                _OnlineButton(onPressed: widget.onViewOnline!),
                             ],
                           ),
+                          // Indicador de disponibilidad en linea
+                          if (widget.reportPublicUrl != null) ...[
+                            const SizedBox(height: 4),
+                            Text(
+                              '☁️ Disponible en linea',
+                              style: TextStyle(
+                                fontSize: 10,
+                                fontStyle: FontStyle.italic,
+                                color:
+                                    isDark
+                                        ? const Color(0xFF46E0C9)
+                                        : const Color(0xFF59A897),
+                              ),
+                            ),
+                          ],
                         ],
 
                         // ── Timestamp relativo ─────────────
@@ -939,6 +999,36 @@ class _ExportButton extends StatelessWidget {
       label: Text(label, style: TextStyle(color: color, fontSize: 12)),
       style: OutlinedButton.styleFrom(
         side: BorderSide(color: color.withOpacity(0.5)),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        minimumSize: Size.zero,
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// NUEVO — BOTON VER ONLINE
+// Aparece en la burbuja solo despues de un export exitoso al servidor.
+// Abre el reporte en el navegador externo del dispositivo.
+// ─────────────────────────────────────────────────────────────────
+class _OnlineButton extends StatelessWidget {
+  final VoidCallback onPressed;
+  const _OnlineButton({required this.onPressed});
+
+  @override
+  Widget build(BuildContext context) {
+    const color = Color(0xFF1565C0);
+    return OutlinedButton.icon(
+      onPressed: onPressed,
+      icon: const Icon(Icons.open_in_browser_rounded, size: 14, color: color),
+      label: const Text(
+        'Ver Online',
+        style: TextStyle(color: color, fontSize: 12),
+      ),
+      style: OutlinedButton.styleFrom(
+        side: const BorderSide(color: Color(0x801565C0)),
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
         minimumSize: Size.zero,
         tapTargetSize: MaterialTapTargetSize.shrinkWrap,

@@ -1,17 +1,38 @@
+// =============================================================================
 // lib/services/report_service.dart
-// Servicio central de reportes financieros.
-// Orquesta: DataService → procesamiento → ChatService (IA) → helpers de exportación.
+// =============================================================================
+// CAMBIOS RESPECTO A LA VERSIÓN ORIGINAL:
+//   1. exportToPDF() ahora llama a UploadService.subirReporte() automáticamente
+//      después de generar el PDF local → asigna report.pdfPublicUrl
+//   2. exportToExcel() hace lo mismo → asigna report.excelPublicUrl
+//   3. Se añade _subirArchivoYActualizar() como método interno reutilizable
+//      que encapsula toda la lógica de subida y actualización del modelo
+//   4. Los métodos de exportación ahora devuelven (File, String?) donde
+//      String? es la URL pública (puede ser null si la subida falló)
 //
-// Conexiones:
-//   messageProvider.dart llama a generateReport() y generateChart()
-//   chatMain.dart llama a exportToPDF() y exportToExcel() desde los botones
-//   ReportService llama internamente a DataService, ChatService, PdfHelper, ExcelHelper
+// FLUJO COMPLETO NUEVO:
+//   1. messageProvider llama a generateReport()      → ReportModel local
+//   2. Usuario pulsa "PDF" en la burbuja del chat
+//   3. messageProvider llama a exportToPDF(report)
+//      a. PdfHelper.generateReportPdf()              → File local
+//      b. UploadService.subirReporte()               → URL pública en Donweb
+//      c. report.pdfPublicUrl = url                 → modelo actualizado
+//      d. Share.shareXFiles()                        → compartir localmente
+//   4. messageProvider llama a _actualizarMensajeEnFirestore()
+//      → persiste la URL pública en el snapshot de Firestore
+//
+// CONEXIONES:
+//   → messageProvider.dart llama a generateReport(), exportToPDF(), exportToExcel()
+//   → UploadService maneja la comunicación HTTP con el servidor PHP
+//   → ReportModel recibe las URLs y las persiste vía toSnapshotMap()
+// =============================================================================
 
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_application_4_geodesica/model/report_model.dart';
 import 'package:flutter_application_4_geodesica/services/chat_service.dart';
 import 'package:flutter_application_4_geodesica/services/data_service.dart';
+import 'package:flutter_application_4_geodesica/services/upload_service.dart';
 import 'package:flutter_application_4_geodesica/helpers/pdf_helper.dart';
 import 'package:flutter_application_4_geodesica/helpers/excel_helper.dart';
 import 'package:flutter_application_4_geodesica/widgets/chart_widget.dart';
@@ -19,11 +40,10 @@ import 'package:flutter_application_4_geodesica/widgets/chart_widget.dart';
 class ReportService {
   final ChatService _chatService = ChatService();
 
-  // ─────────────────────────────────────────────────────────────
-  // GENERAR REPORTE COMPLETO
+  // ── GENERAR REPORTE COMPLETO ──────────────────────────────────────────────
+  // Sin cambios respecto a la versión original.
   // Llamado desde messageProvider._handleReportOrChart()
-  // Devuelve un ReportModel listo para mostrar en el chat y exportar
-  // ─────────────────────────────────────────────────────────────
+  // Devuelve un ReportModel listo para mostrar en el chat y exportar.
   Future<ReportModel> generateReport(
     String type, {
     DateTime? from,
@@ -42,7 +62,7 @@ class ReportService {
     // 3. Construir datos para gráfica
     final chartData = _buildChartData(rawData);
 
-    // 4. Solicitar resumen a IA
+    // 4. Solicitar resumen a la IA (OpenAI)
     final summary = await _chatService.generateReportText({
       'tipo': _labelTipo(type),
       'periodo': _formatPeriodo(rangeFrom, rangeTo),
@@ -62,14 +82,12 @@ class ReportService {
       chartData: chartData,
       summary: summary,
       financialData: financialData,
+      // pdfPublicUrl / excelPublicUrl son null hasta que el usuario exporte
     );
   }
 
-  // ─────────────────────────────────────────────────────────────
-  // GENERAR WIDGET DE GRÁFICA
-  // Llamado desde messageProvider._handleReportOrChart()
-  // El widget resultante se guarda en RichMessage.chartWidget
-  // ─────────────────────────────────────────────────────────────
+  // ── GENERAR WIDGET DE GRÁFICA ─────────────────────────────────────────────
+  // Sin cambios. Llamado desde messageProvider._handleReportOrChart()
   Widget generateChart(String chartType, List<Map<String, dynamic>> data) {
     switch (chartType.toLowerCase()) {
       case 'pie':
@@ -82,35 +100,112 @@ class ReportService {
     }
   }
 
-  // ─────────────────────────────────────────────────────────────
-  // EXPORTAR A PDF
-  // Llamado desde messageProvider.exportReportToPDF()
-  // Retorna el File para que chatMain pueda compartirlo con Share
-  // ─────────────────────────────────────────────────────────────
-  Future<File> exportToPDF(ReportModel report) async {
+  // ── EXPORTAR A PDF + SUBIR AL SERVIDOR ───────────────────────────────────
+  // MODIFICADO: ahora sube automáticamente el PDF al servidor Donweb.
+  //
+  // Parámetros:
+  //   [report]    — ReportModel con los datos financieros
+  //   [mensajeId] — ID del RichMessage en Firestore (para vincular en la BD)
+  //   [chatId]    — ID del chat (para la consulta por chat en reporte_query.php)
+  //
+  // Retorna el File local (para compartir con Share.shareXFiles).
+  // Como efecto secundario: asigna report.pdfPublicUrl si la subida fue exitosa.
+  Future<File> exportToPDF(
+    ReportModel report, {
+    String mensajeId = '',
+    String chatId = '',
+  }) async {
+    // Paso 1: Generar el archivo PDF localmente (sin cambios)
     final file = await PdfHelper.generateReportPdf(report);
     report.pdfFile = file;
+
+    // Paso 2: Subir el PDF al servidor Donweb (NUEVO)
+    await _subirArchivoYActualizar(
+      archivo: file,
+      report: report,
+      formato: 'pdf',
+      mensajeId: mensajeId,
+      chatId: chatId,
+    );
+
+    // Retornamos el archivo local para que messageProvider pueda compartirlo
     return file;
   }
 
-  // ─────────────────────────────────────────────────────────────
-  // EXPORTAR A EXCEL
-  // Llamado desde messageProvider.exportReportToExcel()
-  // ─────────────────────────────────────────────────────────────
-  Future<File> exportToExcel(ReportModel report) async {
+  // ── EXPORTAR A EXCEL + SUBIR AL SERVIDOR ──────────────────────────────────
+  // MODIFICADO: ahora sube automáticamente el Excel al servidor Donweb.
+  Future<File> exportToExcel(
+    ReportModel report, {
+    String mensajeId = '',
+    String chatId = '',
+  }) async {
+    // Paso 1: Generar el archivo Excel localmente (sin cambios)
     final file = await ExcelHelper.generateReportExcel(report);
     report.excelFile = file;
+
+    // Paso 2: Subir el Excel al servidor Donweb (NUEVO)
+    await _subirArchivoYActualizar(
+      archivo: file,
+      report: report,
+      formato: 'excel',
+      mensajeId: mensajeId,
+      chatId: chatId,
+    );
+
     return file;
   }
 
-  // ─────────────────────────────────────────────────────────────
-  // MÉTODO LEGACY — compatibilidad con el chatMain.dart original
-  // que llamaba a ReportService().getIncomeStatement()
-  // ─────────────────────────────────────────────────────────────
+  // ── MÉTODO INTERNO: SUBIR ARCHIVO Y ACTUALIZAR EL MODELO ─────────────────
+  // Encapsula la lógica de subida para evitar duplicar código entre PDF y Excel.
+  //
+  // FLUJO:
+  //   1. Llama a UploadService.subirReporte() con los metadatos del reporte
+  //   2. Si la subida fue exitosa, asigna la URL al campo correspondiente
+  //      del ReportModel (pdfPublicUrl o excelPublicUrl)
+  //   3. Si falla, imprime el error pero NO lanza excepción
+  //      → el reporte sigue funcionando localmente aunque falle la subida
+  Future<void> _subirArchivoYActualizar({
+    required File archivo,
+    required ReportModel report,
+    required String formato, // 'pdf' | 'excel'
+    required String mensajeId,
+    required String chatId,
+  }) async {
+    // Intentar subir al servidor
+    final resultado = await UploadService.subirReporte(
+      archivo: archivo,
+      mensajeId: mensajeId,
+      chatId: chatId,
+      tipo: report.type.name, // Ej: 'estadoResultados'
+      titulo: report.title, // Ej: 'Estado de Resultados'
+      periodo: report.periodoFormateado, // Ej: 'Del 01/01/2025 al 31/01/2025'
+      formato: formato,
+    );
+
+    if (resultado.success && resultado.publicUrl != null) {
+      // ✅ Subida exitosa: asignar URL pública al modelo
+      if (formato == 'pdf') {
+        report.pdfPublicUrl = resultado.publicUrl;
+      } else {
+        report.excelPublicUrl = resultado.publicUrl;
+      }
+      report.dbReporteId = resultado.dbId;
+
+      debugPrint('[ReportService] ✅ $formato subido: ${resultado.publicUrl}');
+    } else {
+      // ⚠️ Fallo silencioso: el reporte sigue funcionando localmente
+      // La URL quedará null y la burbuja no mostrará el botón "Ver online"
+      debugPrint(
+        '[ReportService] ⚠️ No se pudo subir $formato: ${resultado.errorMessage}',
+      );
+    }
+  }
+
+  // ── MÉTODO LEGACY ─────────────────────────────────────────────────────────
+  // Compatibilidad con el chatMain.dart original
   Future<Map<String, dynamic>> getIncomeStatement({String? period}) async {
     final rawData = await DataService.getMovimientosRaw();
 
-    // Filtrar por período si se especifica (formato 'YYYY-MM')
     List<Map<String, dynamic>> filtered = rawData;
     if (period != null) {
       filtered =
@@ -132,11 +227,8 @@ class ReportService {
     };
   }
 
-  // ─────────────────────────────────────────────────────────────
-  // INTERNOS
-  // ─────────────────────────────────────────────────────────────
+  // ── MÉTODOS INTERNOS ──────────────────────────────────────────────────────
 
-  /// Obtiene movimientos crudos del backend y los filtra por rango de fechas
   Future<List<Map<String, dynamic>>> _fetchFiltered(
     DateTime from,
     DateTime to,
@@ -146,12 +238,11 @@ class ReportService {
       final fechaStr =
           m['fecha_creacion']?.toString() ?? m['periodo']?.toString() ?? '';
       final fecha = DateTime.tryParse(fechaStr);
-      if (fecha == null) return true; // incluir si no parseable
+      if (fecha == null) return true;
       return !fecha.isBefore(from) && !fecha.isAfter(to);
     }).toList();
   }
 
-  /// Calcula ingresos, gastos y utilidad a partir de los movimientos
   Map<String, dynamic> _calcularCifras(List<Map<String, dynamic>> data) {
     double ingresos = 0;
     double gastos = 0;
@@ -170,12 +261,10 @@ class ReportService {
           cat.contains('egreso')) {
         gastos += valor;
       } else {
-        // Si no se puede clasificar, se asume ingreso si positivo
-        if (valor > 0) {
+        if (valor > 0)
           ingresos += valor;
-        } else {
+        else
           gastos += valor.abs();
-        }
       }
     }
 
@@ -187,7 +276,6 @@ class ReportService {
     };
   }
 
-  /// Agrupa por categoría para alimentar las gráficas
   List<Map<String, dynamic>> _buildChartData(List<Map<String, dynamic>> data) {
     final Map<String, double> porCategoria = {};
     for (final m in data) {
@@ -196,7 +284,6 @@ class ReportService {
       porCategoria[cat] = (porCategoria[cat] ?? 0) + valor.abs();
     }
 
-    // Ordenar de mayor a menor valor
     final entries =
         porCategoria.entries.toList()
           ..sort((a, b) => b.value.compareTo(a.value));
@@ -240,7 +327,8 @@ class ReportService {
 
   String _formatPeriodo(DateTime from, DateTime to) {
     String fmt(DateTime d) =>
-        '${d.day.toString().padLeft(2, '0')}/${d.month.toString().padLeft(2, '0')}/${d.year}';
+        '${d.day.toString().padLeft(2, '0')}/'
+        '${d.month.toString().padLeft(2, '0')}/${d.year}';
     return 'Del ${fmt(from)} al ${fmt(to)}';
   }
 }

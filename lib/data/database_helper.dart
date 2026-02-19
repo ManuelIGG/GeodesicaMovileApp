@@ -3,11 +3,11 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 
 class DatabaseHelper {
   static final DatabaseHelper _instance = DatabaseHelper._internal();
-  
+
   // Firestore instance
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
   final FirebaseAuth _auth = FirebaseAuth.instance;
-  
+
   // Nombres de colecciones (equivalentes a tablas)
   final String tableUsers = 'users';
   final String tableChats = 'chats';
@@ -30,38 +30,37 @@ class DatabaseHelper {
     return timestamp.toString();
   }
 
- 
-    // CRUD para Usuarios
+  // CRUD para Usuarios
   Future<String> insertUser(Map<String, dynamic> row) async {
     try {
       // Verificar que los campos requeridos estén presentes
       if (!row.containsKey('email') || !row.containsKey('password')) {
         throw Exception('Email y contraseña son requeridos para crear usuario');
       }
-      
+
       // Primero creamos el usuario en Firebase Authentication
       final userCredential = await _auth.createUserWithEmailAndPassword(
         email: row['email'].toString(),
         password: row['password'].toString(),
       );
-      
+
       // Luego guardamos la información adicional en Firestore
       final userData = Map<String, dynamic>.from(row);
       userData.remove('password'); // No guardamos la contraseña en Firestore
-      
+
       // Asegurar que los campos existan antes de guardar
       userData['created_at'] = FieldValue.serverTimestamp();
-      
+
       // Asegurarse de que los campos opcionales no sean null
       if (!userData.containsKey('fullName') || userData['fullName'] == null) {
         userData['fullName'] = 'Usuario';
       }
-      
+
       await _firestore
           .collection(tableUsers)
           .doc(userCredential.user!.uid)
           .set(userData);
-      
+
       return userCredential.user!.uid;
     } catch (e) {
       print('Error al insertar usuario: $e');
@@ -71,11 +70,12 @@ class DatabaseHelper {
 
   Future<Map<String, dynamic>?> getUserByEmail(String email) async {
     try {
-      final querySnapshot = await _firestore
-          .collection(tableUsers)
-          .where('email', isEqualTo: email)
-          .limit(1)
-          .get();
+      final querySnapshot =
+          await _firestore
+              .collection(tableUsers)
+              .where('email', isEqualTo: email)
+              .limit(1)
+              .get();
 
       if (querySnapshot.docs.isNotEmpty) {
         final doc = querySnapshot.docs.first;
@@ -94,10 +94,7 @@ class DatabaseHelper {
   // Método adicional para obtener usuario por UID
   Future<Map<String, dynamic>?> getUserByUid(String uid) async {
     try {
-      final doc = await _firestore
-          .collection(tableUsers)
-          .doc(uid)
-          .get();
+      final doc = await _firestore.collection(tableUsers).doc(uid).get();
 
       if (doc.exists) {
         final data = doc.data()!;
@@ -128,11 +125,12 @@ class DatabaseHelper {
 
   Future<List<Map<String, dynamic>>> getChatsForUser(String userId) async {
     try {
-      final querySnapshot = await _firestore
-          .collection(tableChats)
-          .where('user_id', isEqualTo: userId)
-          .orderBy('created_at', descending: true)
-          .get();
+      final querySnapshot =
+          await _firestore
+              .collection(tableChats)
+              .where('user_id', isEqualTo: userId)
+              .orderBy('created_at', descending: true)
+              .get();
 
       return querySnapshot.docs.map((doc) {
         final data = doc.data();
@@ -162,11 +160,12 @@ class DatabaseHelper {
 
   Future<List<Map<String, dynamic>>> getMessagesForChat(String chatId) async {
     try {
-      final querySnapshot = await _firestore
-          .collection(tableChatMessages)
-          .where('chat_id', isEqualTo: chatId)
-          .orderBy('timestamp', descending: false)
-          .get();
+      final querySnapshot =
+          await _firestore
+              .collection(tableChatMessages)
+              .where('chat_id', isEqualTo: chatId)
+              .orderBy('timestamp', descending: false)
+              .get();
 
       return querySnapshot.docs.map((doc) {
         final data = doc.data();
@@ -183,10 +182,11 @@ class DatabaseHelper {
   Future<void> deleteChat(String chatId) async {
     try {
       // Primero eliminamos todos los mensajes asociados al chat
-      final messagesSnapshot = await _firestore
-          .collection(tableChatMessages)
-          .where('chat_id', isEqualTo: chatId)
-          .get();
+      final messagesSnapshot =
+          await _firestore
+              .collection(tableChatMessages)
+              .where('chat_id', isEqualTo: chatId)
+              .get();
 
       // Eliminar cada mensaje individualmente
       final batch = _firestore.batch();
@@ -207,15 +207,14 @@ class DatabaseHelper {
     try {
       // Verificar si el chat existe
       final doc = await _firestore.collection(tableChats).doc(chatId).get();
-      
+
       if (!doc.exists) {
         throw Exception('Chat no encontrado con ID: $chatId');
       }
 
-      await _firestore
-          .collection(tableChats)
-          .doc(chatId)
-          .update({'title': newTitle});
+      await _firestore.collection(tableChats).doc(chatId).update({
+        'title': newTitle,
+      });
     } catch (e) {
       print('Error al actualizar título del chat: $e');
       rethrow;
@@ -225,10 +224,7 @@ class DatabaseHelper {
   // Método adicional para actualizar información de usuario
   Future<void> updateUser(String userId, Map<String, dynamic> updates) async {
     try {
-      await _firestore
-          .collection(tableUsers)
-          .doc(userId)
-          .update(updates);
+      await _firestore.collection(tableUsers).doc(userId).update(updates);
     } catch (e) {
       print('Error al actualizar usuario: $e');
       rethrow;
@@ -239,31 +235,33 @@ class DatabaseHelper {
   Future<void> deleteUser(String userId) async {
     try {
       // Primero eliminamos todos los chats del usuario
-      final chatsSnapshot = await _firestore
-          .collection(tableChats)
-          .where('user_id', isEqualTo: userId)
-          .get();
+      final chatsSnapshot =
+          await _firestore
+              .collection(tableChats)
+              .where('user_id', isEqualTo: userId)
+              .get();
 
       final batch = _firestore.batch();
-      
+
       // Para cada chat, eliminamos sus mensajes primero
       for (final chatDoc in chatsSnapshot.docs) {
-        final messagesSnapshot = await _firestore
-            .collection(tableChatMessages)
-            .where('chat_id', isEqualTo: chatDoc.id)
-            .get();
-            
+        final messagesSnapshot =
+            await _firestore
+                .collection(tableChatMessages)
+                .where('chat_id', isEqualTo: chatDoc.id)
+                .get();
+
         for (final msgDoc in messagesSnapshot.docs) {
           batch.delete(msgDoc.reference);
         }
         batch.delete(chatDoc.reference);
       }
-      
+
       await batch.commit();
-      
+
       // Finalmente eliminamos el usuario
       await _firestore.collection(tableUsers).doc(userId).delete();
-      
+
       // También eliminamos la cuenta de Authentication
       await _auth.currentUser?.delete();
     } catch (e) {
@@ -286,40 +284,131 @@ class DatabaseHelper {
     }
   }
 
+  // Stream para obtener mensajes de chat en tiempo real
+  Stream<List<Map<String, dynamic>>> getMessagesForChatStream(String chatId) {
+    return _firestore
+        .collection(tableChatMessages)
+        .where('chat_id', isEqualTo: chatId)
+        .orderBy('timestamp', descending: false)
+        .snapshots()
+        .map((querySnapshot) {
+          return querySnapshot.docs.map((doc) {
+            final data = doc.data();
+            data['id'] = doc.id;
+            data['timestamp'] = _timestampToString(data['timestamp']);
+            return data;
+          }).toList();
+        });
+  }
 
+  // Stream para obtener chats de usuario en tiempo real
+  Stream<List<Map<String, dynamic>>> getChatsForUserStream(String userId) {
+    return _firestore
+        .collection(tableChats)
+        .where('user_id', isEqualTo: userId)
+        .orderBy('created_at', descending: true)
+        .snapshots()
+        .map((querySnapshot) {
+          return querySnapshot.docs.map((doc) {
+            final data = doc.data();
+            data['id'] = doc.id;
+            data['created_at'] = _timestampToString(data['created_at']);
+            return data;
+          }).toList();
+        });
+  }
 
-// Stream para obtener mensajes de chat en tiempo real
-Stream<List<Map<String, dynamic>>> getMessagesForChatStream(String chatId) {
-  return _firestore
-      .collection(tableChatMessages)
-      .where('chat_id', isEqualTo: chatId)
-      .orderBy('timestamp', descending: false)
-      .snapshots()
-      .map((querySnapshot) {
-    return querySnapshot.docs.map((doc) {
-      final data = doc.data();
-      data['id'] = doc.id;
-      data['timestamp'] = _timestampToString(data['timestamp']);
-      return data;
-    }).toList();
-  });
-}
+  // ══════════════════════════════════════════════════════════════════════════
+  // NUEVO — updateMessageFields
+  // ══════════════════════════════════════════════════════════════════════════
+  //
+  // PROPÓSITO:
+  //   Actualiza campos específicos de un documento en 'chat_messages' sin
+  //   sobreescribir ningún otro campo ya existente (rol, message, chat_id,
+  //   timestamp, report_snapshot previo, etc.).
+  //
+  // CUÁNDO SE LLAMA:
+  //   messageProvider._actualizarUrlEnFirestore() lo llama justo después de
+  //   que UploadService.subirReporte() devuelve una URL pública exitosa.
+  //   En ese momento se persisten en Firestore:
+  //     - 'pdf_public_url'   → URL del PDF subido al servidor Donweb
+  //     - 'excel_public_url' → URL del Excel subido al servidor Donweb
+  //     - 'report_snapshot'  → snapshot del ReportModel actualizado con la URL
+  //
+  // COMPATIBILIDAD:
+  //   Usa el doc.id real de Firestore, que es el mismo que getMessagesForChat()
+  //   guarda en data['id'] y que fromFirestoreMap() asigna a RichMessage.id.
+  //   Por eso messageProvider puede pasar directamente message.id a este método.
+  //
+  // PARÁMETROS:
+  //   [messageId] — doc.id del documento en 'chat_messages'
+  //   [campos]    — Map con solo los campos a actualizar
+  // ══════════════════════════════════════════════════════════════════════════
+  Future<void> updateMessageFields(
+    String messageId,
+    Map<String, dynamic> campos,
+  ) async {
+    if (messageId.isEmpty) {
+      print('[DatabaseHelper] updateMessageFields: messageId vacío, ignorado.');
+      return;
+    }
 
-// Stream para obtener chats de usuario en tiempo real
-Stream<List<Map<String, dynamic>>> getChatsForUserStream(String userId) {
-  return _firestore
-      .collection(tableChats)
-      .where('user_id', isEqualTo: userId)
-      .orderBy('created_at', descending: true)
-      .snapshots()
-      .map((querySnapshot) {
-    return querySnapshot.docs.map((doc) {
-      final data = doc.data();
-      data['id'] = doc.id;
-      data['created_at'] = _timestampToString(data['created_at']);
-      return data;
-    }).toList();
-  });
-}
+    try {
+      // update() modifica SOLO los campos del Map; no toca los demás.
+      await _firestore
+          .collection(tableChatMessages)
+          .doc(messageId)
+          .update(campos);
 
+      print(
+        '[DatabaseHelper] ✅ Mensaje $messageId actualizado: ${campos.keys.toList()}',
+      );
+    } on FirebaseException catch (e) {
+      // 'not-found': el doc.id que tiene RichMessage no existe como documento.
+      // Esto puede pasar si el mensaje fue creado antes de esta actualización
+      // y su id en memoria no coincide con el doc.id de Firestore.
+      // En ese caso buscamos por el campo 'id' guardado dentro del documento.
+      if (e.code == 'not-found') {
+        print(
+          '[DatabaseHelper] Doc no encontrado por ID directo, buscando por campo id...',
+        );
+        await _updateByQueryId(messageId, campos);
+      } else {
+        print('[DatabaseHelper] FirebaseException: ${e.code} — ${e.message}');
+      }
+    } catch (e) {
+      print('[DatabaseHelper] Error en updateMessageFields: $e');
+    }
+  }
+
+  // ── Auxiliar privado ──────────────────────────────────────────────────────
+  // Busca el documento que tiene el campo 'id' == messageId y lo actualiza.
+  // Cubre el caso donde insertChatMessage (que usa .add()) generó un doc.id
+  // diferente al RichMessage.id asignado en el provider.
+  Future<void> _updateByQueryId(
+    String messageId,
+    Map<String, dynamic> campos,
+  ) async {
+    try {
+      final query =
+          await _firestore
+              .collection(tableChatMessages)
+              .where('id', isEqualTo: messageId)
+              .limit(1)
+              .get();
+
+      if (query.docs.isEmpty) {
+        print(
+          '[DatabaseHelper] ⚠️ No se encontró doc con id=$messageId. '
+          'La URL quedará solo en memoria para esta sesión.',
+        );
+        return;
+      }
+
+      await query.docs.first.reference.update(campos);
+      print('[DatabaseHelper] ✅ Doc actualizado por campo id: $messageId');
+    } catch (e) {
+      print('[DatabaseHelper] Error en _updateByQueryId: $e');
+    }
+  }
 }
