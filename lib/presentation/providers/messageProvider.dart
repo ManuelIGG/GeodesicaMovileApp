@@ -1,35 +1,21 @@
-// =============================================================================
 // lib/presentation/providers/messageProvider.dart
-// =============================================================================
-// CAMBIOS RESPECTO A LA VERSIÓN ORIGINAL:
+// ============================================================================
+// CAMBIO PRINCIPAL respecto a la versión anterior:
 //
-//   1. loadMessagesFromChat() ahora:
-//      a. Carga mensajes desde Firestore (igual que antes)
-//      b. Para cada mensaje de tipo 'report' que tiene snapshot guardado,
-//         reconstruye el chartWidget usando ReportService.generateChart()
-//         → el reporte vuelve a aparecer con su gráfica al reabrir el chat
+//   _handleReportOrChart() ahora pasa intent.originalText a generateReport()
+//   como parámetro [userPrompt]. Ese texto es el que la IA usa para decidir
+//   qué SQL generar, qué datos traer y qué gráfica construir.
 //
-//   2. _handleReportOrChart() ahora:
-//      a. Genera el reporte (igual que antes)
-//      b. Persiste el snapshot en Firestore ANTES de exportar
-//         → el mensaje ya queda guardado aunque el usuario no exporte
+//   SIN ESTE CAMBIO: generateReport() recibe solo el tipo ('resultados') y
+//   el rango de fechas, lo cual siempre produce el mismo reporte genérico.
 //
-//   3. exportReportToPDF() / exportReportToExcel() ahora:
-//      a. Pasan mensajeId y chatId a report_service para que UploadService
-//         pueda vincular el archivo subido con el mensaje en Firestore
-//      b. Después de exportar, llaman a _actualizarUrlEnFirestore()
-//         para persistir la URL pública recién obtenida en el snapshot
+//   CON ESTE CAMBIO: generateReport() recibe el texto completo del usuario,
+//   por ejemplo "muéstrame ventas por producto esta semana en gráfica pastel",
+//   y la IA construye exactamente eso.
 //
-//   4. Se añade _actualizarUrlEnFirestore() — actualiza el campo
-//      pdf_public_url / excel_public_url en el documento Firestore
-//      del mensaje correspondiente, sin borrar los demás campos.
-//
-// CONEXIONES:
-//   → ChatService (parseCommand, getChatResponse)
-//   → ReportService (generateReport, generateChart, exportToPDF, exportToExcel)
-//   → DatabaseHelper (persistir y actualizar mensajes en Firestore)
-//   → chatMain.dart (consume messages, isLoading, exportar, reportPublicUrl)
-// =============================================================================
+//   El resto del archivo no cambia — persistencia, exportación y streams
+//   funcionan igual que antes.
+// ============================================================================
 
 import 'package:flutter/foundation.dart';
 import 'package:share_plus/share_plus.dart';
@@ -51,7 +37,6 @@ class ChatProvider with ChangeNotifier {
   final ChatService _chatService = ChatService();
   final ReportService _reportService = ReportService();
 
-  // chatId activo — se asigna en loadMessagesFromChat() y se usa en los exports
   String _currentChatId = '';
 
   // ── Getters ───────────────────────────────────────────────────────────────
@@ -59,48 +44,32 @@ class ChatProvider with ChangeNotifier {
   bool get isLoading => _isLoading;
   bool get isTyping => _isTyping;
 
-  // ── CARGAR MENSAJES DESDE FIRESTORE ───────────────────────────────────────
-  // MODIFICADO: después de cargar los mensajes de texto, reconstruye los
-  // chartWidgets de los mensajes de tipo 'report' que tienen snapshot guardado.
-  //
-  // Esto permite que al reabrir el chat, las burbujas de reporte aparezcan
-  // completas con su gráfica, sin necesidad de volver a llamar al backend.
+  // ── CARGAR MENSAJES DESDE FIRESTORE (sin cambios) ─────────────────────────
   Future<void> loadMessagesFromChat(String chatId) async {
     _currentChatId = chatId;
 
-    // 1. Cargar todos los mensajes desde Firestore
-    //    RichMessage.fromFirestoreMap() ya reconstruye el ReportModel si
-    //    existe 'report_snapshot' en el documento.
     final dbMessages = await _dbHelper.getMessagesForChat(chatId);
     final mensajesBase =
         dbMessages.map((m) => RichMessage.fromFirestoreMap(m)).toList();
 
-    // 2. Para cada mensaje de reporte, reconstruir el chartWidget
-    //    (Los widgets no se pueden serializar, hay que recrearlos en memoria)
     _messages =
         mensajesBase.map((msg) {
           if (msg.isReport && msg.report != null) {
             final chartData = msg.report!.chartData;
             final chartType = _chartTypeStr(msg.report!.chartType);
-
-            // Reconstruir el widget de gráfica con los mismos datos guardados
             final chartWidget = _reportService.generateChart(
               chartType,
               chartData,
             );
-
-            // Devolver una copia del mensaje con el widget asignado
             return msg.withChartWidget(chartWidget);
           }
-          // Mensajes de texto: sin cambios
           return msg;
         }).toList();
 
     notifyListeners();
   }
 
-  // ── STREAM EN TIEMPO REAL ─────────────────────────────────────────────────
-  // Sin cambios respecto a la versión original.
+  // ── STREAM EN TIEMPO REAL (sin cambios) ───────────────────────────────────
   Stream<List<RichMessage>> getMessagesStream(String chatId) {
     return _dbHelper
         .getMessagesForChatStream(chatId)
@@ -109,12 +78,10 @@ class ChatProvider with ChangeNotifier {
         );
   }
 
-  // ── ENVIAR MENSAJE — PUNTO DE ENTRADA PRINCIPAL ───────────────────────────
-  // Sin cambios estructurales. Se añade guardado de _currentChatId.
+  // ── ENVIAR MENSAJE (sin cambios estructurales) ────────────────────────────
   Future<void> enviarMensajeConIA(String chatId, String textoUsuario) async {
     _currentChatId = chatId;
 
-    // 1. Agregar mensaje del usuario al estado local y a Firestore
     final userMsg = RichMessage(
       id: _newId(),
       rol: 'user',
@@ -128,10 +95,10 @@ class ChatProvider with ChangeNotifier {
     notifyListeners();
 
     try {
-      // 2. Parsear intención (reporte/gráfica vs. conversacional)
       final intent = _chatService.parseCommand(textoUsuario);
 
       if (intent.isReportRequest || intent.isChartRequest) {
+        // ── CAMBIO: se pasa el intent completo (con originalText) ────────────
         await _handleReportOrChart(chatId, intent);
       } else {
         final respuesta = await _chatService.getChatResponse(textoUsuario);
@@ -160,22 +127,42 @@ class ChatProvider with ChangeNotifier {
     }
   }
 
-  // ── FLUJO DE REPORTE Y GRÁFICA ────────────────────────────────────────────
-  // MODIFICADO: el snapshot del reporte se persiste en Firestore tan pronto
-  // como se genera el mensaje (sin esperar a que el usuario exporte).
-  // Esto garantiza que el reporte aparezca al recargar aunque nunca se exporte.
+  // ═══════════════════════════════════════════════════════════════════════════
+  // FLUJO DE REPORTE Y GRÁFICA — CAMBIO PRINCIPAL
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // ANTES: generateReport(intent.reportType, from: ..., to: ...)
+  //   El tipo 'resultados' siempre producía el mismo reporte genérico.
+  //
+  // AHORA: generateReport(intent.reportType, ..., userPrompt: intent.originalText)
+  //   El texto completo del usuario llega a ChatService.generateReportFromPrompt()
+  //   donde la IA decide qué SQL ejecutar, qué datos traer y qué gráfica hacer.
+  //
+  // EJEMPLO:
+  //   Usuario: "muéstrame las ventas por vendedor de esta semana en barras"
+  //   intent.originalText = "muéstrame las ventas por vendedor de esta semana en barras"
+  //   → IA genera: SELECT u.nombre AS label, SUM(v.total) AS value
+  //                FROM ventas v JOIN usuarios u ON u.idUsuario = v.idVendedor
+  //                WHERE v.fecha_venta >= '2025-05-26' AND v.fecha_venta <= '2025-06-01'
+  //                AND v.estado != 'cancelada' GROUP BY u.idUsuario ORDER BY value DESC
+  //   → chartType: 'bar'
+  //   → title: 'Ventas por Vendedor — Semana del 26/05 al 01/06'
+  // ═══════════════════════════════════════════════════════════════════════════
   Future<void> _handleReportOrChart(String chatId, CommandIntent intent) async {
-    // 1. Generar reporte completo (datos + resumen IA)
+    // 1. Generar reporte dinámico según el texto exacto del usuario
+    //    CAMBIO CLAVE: se pasa userPrompt: intent.originalText
     final report = await _reportService.generateReport(
       intent.reportType ?? 'resultados',
       from: intent.timeRange.start,
       to: intent.timeRange.end,
+      userPrompt: intent.originalText, // ← CAMBIO: texto original del usuario
     );
 
-    // 2. Determinar tipo de gráfica
+    // 2. El chartType ahora viene de la IA (no del intent hardcodeado)
+    //    Pero si el usuario especificó uno en el intent, lo respetamos
     final chartTypeStr = intent.chartType ?? _chartTypeStr(report.chartType);
 
-    // 3. Crear widget de gráfica
+    // 3. Crear widget de gráfica con los datos que trajo la IA
     final chartWidget = _reportService.generateChart(
       chartTypeStr,
       report.chartData,
@@ -185,10 +172,11 @@ class ChatProvider with ChangeNotifier {
     final now = report.generatedAt;
     final hora = '${now.hour}:${now.minute.toString().padLeft(2, '0')}';
 
-    // 5. Asignar un ID fijo al mensaje para poder referenciarlo en el upload
+    // 5. Asignar ID fijo al mensaje para referenciarlo en el upload
     final msgId = _newId();
 
-    // 6. Construir el RichMessage con el reporte
+    // 6. Construir el RichMessage
+    //    El título ahora es dinámico (viene de la IA, no hardcodeado)
     final botMsg = RichMessage(
       id: msgId,
       rol: 'assistant',
@@ -205,16 +193,11 @@ class ChatProvider with ChangeNotifier {
     // 7. Mostrar en la UI
     _addMessage(botMsg);
 
-    // 8. Persistir en Firestore CON el snapshot del reporte
-    //    → el mensaje queda guardado con todos los datos de la gráfica
-    //    → al reabrir el chat, fromFirestoreMap() reconstruirá el ReportModel
+    // 8. Persistir en Firestore con snapshot del reporte
     await _persistir(chatId, botMsg);
   }
 
-  // ── EXPORTAR A PDF ────────────────────────────────────────────────────────
-  // MODIFICADO:
-  //   - Pasa mensajeId y chatId a exportToPDF() para el upload
-  //   - Después de exportar, actualiza la URL pública en Firestore
+  // ── EXPORTAR A PDF (sin cambios) ──────────────────────────────────────────
   Future<void> exportReportToPDF(String messageId) async {
     final msg = _findById(messageId);
     if (msg?.report == null) return;
@@ -223,15 +206,12 @@ class ChatProvider with ChangeNotifier {
     notifyListeners();
 
     try {
-      // Exportar localmente Y subir al servidor
       final file = await _reportService.exportToPDF(
         msg!.report!,
-        mensajeId: messageId, // ← NUEVO: para vincular en la BD del servidor
-        chatId: _currentChatId, // ← NUEVO: para agrupar por chat
+        mensajeId: messageId,
+        chatId: _currentChatId,
       );
 
-      // Si la subida fue exitosa, persistir la URL en Firestore
-      // para que esté disponible al recargar el chat
       if (msg.report!.pdfPublicUrl != null) {
         await _actualizarUrlEnFirestore(
           messageId: messageId,
@@ -241,7 +221,6 @@ class ChatProvider with ChangeNotifier {
         );
       }
 
-      // Compartir el archivo localmente (comportamiento original)
       await Share.shareXFiles([
         XFile(file.path),
       ], text: 'Reporte financiero — ${msg.report!.title}');
@@ -253,8 +232,7 @@ class ChatProvider with ChangeNotifier {
     }
   }
 
-  // ── EXPORTAR A EXCEL ──────────────────────────────────────────────────────
-  // MODIFICADO: igual que exportReportToPDF() pero para Excel.
+  // ── EXPORTAR A EXCEL (sin cambios) ────────────────────────────────────────
   Future<void> exportReportToExcel(String messageId) async {
     final msg = _findById(messageId);
     if (msg?.report == null) return;
@@ -289,35 +267,21 @@ class ChatProvider with ChangeNotifier {
     }
   }
 
-  // ── ACTUALIZAR URL EN FIRESTORE ────────────────────────────────────────────
-  // NUEVO: actualiza el campo de URL pública en el documento Firestore del mensaje
-  // y también actualiza el snapshot del reporte para que incluya la nueva URL.
-  //
-  // Esto garantiza que al recargar el chat, la URL esté disponible en el snapshot
-  // y el botón "Ver Online" aparezca en la burbuja.
-  // chatId se eliminó de los parámetros: updateMessageFields() del
-  // database_helper real solo recibe (messageId, campos) — sin chatId.
+  // ── ACTUALIZAR URL EN FIRESTORE (sin cambios) ─────────────────────────────
   Future<void> _actualizarUrlEnFirestore({
     required String messageId,
-    required String campo, // 'pdf_public_url' o 'excel_public_url'
+    required String campo,
     required String url,
     required ReportModel report,
   }) async {
     try {
-      // Snapshot actualizado del reporte con la nueva URL ya asignada
-      // (report.pdfPublicUrl / excelPublicUrl ya fueron seteados por ReportService)
       final snapshotActualizado = report.toSnapshotMap();
-
-      // Llamada correcta: 2 parámetros, igual que la firma de database_helper.dart
       await _dbHelper.updateMessageFields(messageId, {
         campo: url,
         'report_snapshot': snapshotActualizado,
       });
-
       debugPrint('[ChatProvider] ✅ URL actualizada en Firestore: $url');
     } catch (e) {
-      // Fallo silencioso — el archivo ya fue compartido, la URL se pierde
-      // solo en Firestore pero está en memoria para esta sesión
       debugPrint(
         '[ChatProvider] ⚠️ No se pudo actualizar URL en Firestore: $e',
       );

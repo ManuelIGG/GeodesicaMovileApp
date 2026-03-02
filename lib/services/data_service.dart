@@ -1,60 +1,27 @@
 // lib/services/data_service.dart
-// Servicio de datos del backend.
-// Modificado: se añade getMovimientosRaw() que devuelve la lista de objetos
-// sin formatear, para que report_service pueda filtrar y procesar los datos.
+// Se añade método executeSql para enviar consultas SQL al backend.
+// Se conservan los métodos originales para compatibilidad (report_service).
 
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 class DataService {
-  static const String _apiUrl =
+  static const String _movimientosUrl =
       'https://araragricola.com/backend-geodesica/movimientos.php';
+  static const String _executeSqlUrl =
+      'https://araragricola.com/backend-geodesica/execute_query.php';
+  static const int _timeoutSeconds = 30;
 
-  // ─────────────────────────────────────────────────────────────
-  // TEXTO PARA IA (método original, sin cambios)
-  // Usado por chat_service.getChatResponse()
-  // ─────────────────────────────────────────────────────────────
-  static Future<String> getExtractosResumen() async {
-    try {
-      final movimientos = await getMovimientosRaw();
-      if (movimientos.isEmpty) {
-        return 'No hay movimientos financieros disponibles.';
-      }
-      return movimientos
-          .map(
-            (m) => '''
-ID (DB): ${m['id']}
-ID Movimiento: ${m['id_movimiento']}
-Período: ${m['periodo']}
-Categoría: ${m['categoria']}
-Descripción: ${m['descripcion']}
-Valor COP: \$${_formatearNumero(m['valor_cop'])}
-Fecha Creación: ${m['fecha_creacion']}
-Fecha Actualización: ${m['fecha_actualizacion']}
-''',
-          )
-          .join('\n\n');
-    } catch (e) {
-      return 'Error al obtener los datos financieros. Por favor, intenta más tarde.';
-    }
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  // LISTA RAW (NUEVO) — usado por report_service.dart
-  // Devuelve los movimientos como lista de Map sin formatear,
-  // permitiendo filtrar por fecha y agrupar por categoría.
-  // ─────────────────────────────────────────────────────────────
+  // ── Método original (report_service aún lo usa) ──
   static Future<List<Map<String, dynamic>>> getMovimientosRaw() async {
     try {
       final response = await http.get(
-        Uri.parse(_apiUrl),
+        Uri.parse(_movimientosUrl),
         headers: {'Content-Type': 'application/json'},
       );
-
       if (response.statusCode != 200) {
         throw Exception('Error HTTP ${response.statusCode}');
       }
-
       final List<dynamic> data = json.decode(response.body);
       return data.map((e) => Map<String, dynamic>.from(e as Map)).toList();
     } catch (e) {
@@ -63,19 +30,35 @@ Fecha Actualización: ${m['fecha_actualizacion']}
     }
   }
 
-  // Formatea número con separadores de miles
-  static String _formatearNumero(dynamic valor) {
-    if (valor == null) return '0';
+  // ── Ejecutar una consulta SQL segura en el backend ──
+  static Future<List<Map<String, dynamic>>> executeSql(String sql) async {
     try {
-      final n = double.parse(valor.toString());
-      return n
-          .toStringAsFixed(0)
-          .replaceAllMapped(
-            RegExp(r'(\d{1,3})(?=(\d{3})+(?!\d))'),
-            (m) => '${m[1]},',
-          );
-    } catch (_) {
-      return valor.toString();
+      final response = await http
+          .post(
+            Uri.parse(_executeSqlUrl),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'sql': sql}),
+          )
+          .timeout(const Duration(seconds: _timeoutSeconds));
+
+      if (response.statusCode == 200) {
+        final dynamic data = json.decode(response.body);
+        if (data is List) {
+          return data.map((e) => Map<String, dynamic>.from(e)).toList();
+        } else if (data is Map && data.containsKey('error')) {
+          throw Exception(data['error']);
+        } else {
+          return [];
+        }
+      } else {
+        throw Exception('Error HTTP ${response.statusCode}');
+      }
+    } catch (e) {
+      print('DataService.executeSql error: $e');
+      // Devolvemos una lista con un mapa de error para que la IA lo interprete
+      return [
+        {'error': e.toString()},
+      ];
     }
   }
 }

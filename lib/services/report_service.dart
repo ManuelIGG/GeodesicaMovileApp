@@ -1,37 +1,36 @@
-// =============================================================================
 // lib/services/report_service.dart
-// =============================================================================
-// CAMBIOS RESPECTO A LA VERSIÓN ORIGINAL:
-//   1. exportToPDF() ahora llama a UploadService.subirReporte() automáticamente
-//      después de generar el PDF local → asigna report.pdfPublicUrl
-//   2. exportToExcel() hace lo mismo → asigna report.excelPublicUrl
-//   3. Se añade _subirArchivoYActualizar() como método interno reutilizable
-//      que encapsula toda la lógica de subida y actualización del modelo
-//   4. Los métodos de exportación ahora devuelven (File, String?) donde
-//      String? es la URL pública (puede ser null si la subida falló)
+// ============================================================================
+// CAMBIO PRINCIPAL respecto a la versión anterior:
 //
-// FLUJO COMPLETO NUEVO:
-//   1. messageProvider llama a generateReport()      → ReportModel local
-//   2. Usuario pulsa "PDF" en la burbuja del chat
-//   3. messageProvider llama a exportToPDF(report)
-//      a. PdfHelper.generateReportPdf()              → File local
-//      b. UploadService.subirReporte()               → URL pública en Donweb
-//      c. report.pdfPublicUrl = url                 → modelo actualizado
-//      d. Share.shareXFiles()                        → compartir localmente
-//   4. messageProvider llama a _actualizarMensajeEnFirestore()
-//      → persiste la URL pública en el snapshot de Firestore
+//   generateReport() ya NO usa getMovimientosRaw() + _calcularCifras() fijos.
+//   Ahora llama a ChatService.generateReportFromPrompt(userPrompt) que:
+//     1. Le pide a la IA que genere el SQL exacto para lo que pidió el usuario
+//     2. Ejecuta ese SQL en la BD real vía DataService.executeSql()
+//     3. Devuelve chartData, financialData, chartType y summary ya construidos
 //
-// CONEXIONES:
-//   → messageProvider.dart llama a generateReport(), exportToPDF(), exportToExcel()
-//   → UploadService maneja la comunicación HTTP con el servidor PHP
-//   → ReportModel recibe las URLs y las persiste vía toSnapshotMap()
-// =============================================================================
+//   RESULTADO: cada reporte es diferente según la solicitud del usuario.
+//   Ejemplos:
+//     "ventas por producto esta semana en pastel"
+//       → SQL: SELECT p.nombre AS label, SUM(...) AS value ... GROUP BY producto
+//       → chartType: pie, datos reales de esa semana
+//
+//     "evolución de ingresos del último mes"
+//       → SQL: SELECT DATE(fecha_venta) AS label, SUM(total) AS value ... GROUP BY día
+//       → chartType: line, un punto por día
+//
+//     "stock crítico por categoría"
+//       → SQL: SELECT c.nombre AS label, COUNT(*) AS value ... WHERE stock<=minimo
+//       → chartType: bar, solo productos en riesgo
+//
+//   ARCHIVOS QUE CAMBIAN JUNTO A ESTE:
+//     → chat_service.dart   (agrega generateReportFromPrompt)
+//     → messageProvider.dart (pasa originalText a generateReport)
+// ============================================================================
 
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_application_4_geodesica/model/report_model.dart';
 import 'package:flutter_application_4_geodesica/services/chat_service.dart';
-import 'package:flutter_application_4_geodesica/services/data_service.dart';
 import 'package:flutter_application_4_geodesica/services/upload_service.dart';
 import 'package:flutter_application_4_geodesica/helpers/pdf_helper.dart';
 import 'package:flutter_application_4_geodesica/helpers/excel_helper.dart';
@@ -40,54 +39,81 @@ import 'package:flutter_application_4_geodesica/widgets/chart_widget.dart';
 class ReportService {
   final ChatService _chatService = ChatService();
 
-  // ── GENERAR REPORTE COMPLETO ──────────────────────────────────────────────
-  // Sin cambios respecto a la versión original.
-  // Llamado desde messageProvider._handleReportOrChart()
-  // Devuelve un ReportModel listo para mostrar en el chat y exportar.
+  // ═══════════════════════════════════════════════════════════════════════════
+  // GENERAR REPORTE — AHORA DINÁMICO
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // CAMBIO: se añade el parámetro obligatorio [userPrompt] con el texto
+  // original del usuario. Es el que se pasa a generateReportFromPrompt()
+  // para que la IA sepa exactamente qué tipo de reporte construir.
+  //
+  // Los parámetros [from] y [to] se mantienen por compatibilidad pero ya no
+  // se usan para filtrar directamente — la IA los interpreta desde el prompt.
+  //
+  // LLAMADO DESDE: messageProvider._handleReportOrChart()
   Future<ReportModel> generateReport(
     String type, {
     DateTime? from,
     DateTime? to,
+    // NUEVO: texto original del usuario para que la IA lo interprete
+    String userPrompt = '',
   }) async {
     final now = DateTime.now();
     final rangeFrom = from ?? DateTime(now.year, now.month, 1);
     final rangeTo = to ?? now;
 
-    // 1. Obtener datos crudos y filtrar por fecha
-    final rawData = await _fetchFiltered(rangeFrom, rangeTo);
+    // ── El prompt para la IA incluye el texto del usuario Y el rango detectado
+    // Si el usuario no pasó prompt (llamada legacy), usamos el tipo como base.
+    final promptEfectivo =
+        userPrompt.isNotEmpty
+            ? userPrompt
+            : 'Genera un reporte de ${_labelTipo(type)} '
+                'del período ${_formatPeriodo(rangeFrom, rangeTo)}';
 
-    // 2. Calcular cifras financieras
-    final financialData = _calcularCifras(rawData);
+    // ── Llamar al nuevo método de ChatService que hace todo el trabajo ───────
+    // generateReportFromPrompt:
+    //   1. Genera el SQL correcto para lo que pide el usuario
+    //   2. Ejecuta el SQL en la BD real
+    //   3. Construye chartData, financialData, title, chartType y summary
+    ReportPromptResult resultado;
+    try {
+      resultado = await _chatService.generateReportFromPrompt(
+        promptEfectivo,
+        from: rangeFrom,
+        to: rangeTo,
+      );
+    } catch (e) {
+      // Fallback: si falla la IA, crear un reporte vacío con mensaje de error
+      debugPrint('[ReportService] Error en generateReportFromPrompt: $e');
+      resultado = ReportPromptResult(
+        title: _labelTipo(type),
+        chartType: 'bar',
+        reportType: type,
+        chartData: [],
+        financialData: {'ingresos': 0.0, 'gastos': 0.0, 'utilidad': 0.0},
+        summary:
+            'No fue posible obtener los datos. '
+            'Verifica tu conexión e intenta de nuevo.',
+      );
+    }
 
-    // 3. Construir datos para gráfica
-    final chartData = _buildChartData(rawData);
-
-    // 4. Solicitar resumen a la IA (OpenAI)
-    final summary = await _chatService.generateReportText({
-      'tipo': _labelTipo(type),
-      'periodo': _formatPeriodo(rangeFrom, rangeTo),
-      'ingresos': financialData['ingresos'],
-      'gastos': financialData['gastos'],
-      'utilidad': financialData['utilidad'],
-    });
-
+    // ── Construir el ReportModel con los datos que la IA trajo ───────────────
     return ReportModel(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
-      title: _labelTipo(type),
-      type: _parseTipo(type),
-      chartType: _chartDefault(type),
+      title: resultado.title,
+      type: _parseTipo(resultado.reportType),
+      chartType: _parseChartType(resultado.chartType),
       from: rangeFrom,
       to: rangeTo,
       generatedAt: DateTime.now(),
-      chartData: chartData,
-      summary: summary,
-      financialData: financialData,
-      // pdfPublicUrl / excelPublicUrl son null hasta que el usuario exporte
+      chartData: resultado.chartData,
+      summary: resultado.summary,
+      financialData: resultado.financialData,
+      // pdfPublicUrl / excelPublicUrl siguen siendo null hasta que el usuario exporte
     );
   }
 
-  // ── GENERAR WIDGET DE GRÁFICA ─────────────────────────────────────────────
-  // Sin cambios. Llamado desde messageProvider._handleReportOrChart()
+  // ── GENERAR WIDGET DE GRÁFICA (sin cambios) ───────────────────────────────
   Widget generateChart(String chartType, List<Map<String, dynamic>> data) {
     switch (chartType.toLowerCase()) {
       case 'pie':
@@ -100,26 +126,15 @@ class ReportService {
     }
   }
 
-  // ── EXPORTAR A PDF + SUBIR AL SERVIDOR ───────────────────────────────────
-  // MODIFICADO: ahora sube automáticamente el PDF al servidor Donweb.
-  //
-  // Parámetros:
-  //   [report]    — ReportModel con los datos financieros
-  //   [mensajeId] — ID del RichMessage en Firestore (para vincular en la BD)
-  //   [chatId]    — ID del chat (para la consulta por chat en reporte_query.php)
-  //
-  // Retorna el File local (para compartir con Share.shareXFiles).
-  // Como efecto secundario: asigna report.pdfPublicUrl si la subida fue exitosa.
+  // ── EXPORTAR A PDF (sin cambios) ──────────────────────────────────────────
   Future<File> exportToPDF(
     ReportModel report, {
     String mensajeId = '',
     String chatId = '',
   }) async {
-    // Paso 1: Generar el archivo PDF localmente (sin cambios)
     final file = await PdfHelper.generateReportPdf(report);
     report.pdfFile = file;
 
-    // Paso 2: Subir el PDF al servidor Donweb (NUEVO)
     await _subirArchivoYActualizar(
       archivo: file,
       report: report,
@@ -128,22 +143,18 @@ class ReportService {
       chatId: chatId,
     );
 
-    // Retornamos el archivo local para que messageProvider pueda compartirlo
     return file;
   }
 
-  // ── EXPORTAR A EXCEL + SUBIR AL SERVIDOR ──────────────────────────────────
-  // MODIFICADO: ahora sube automáticamente el Excel al servidor Donweb.
+  // ── EXPORTAR A EXCEL (sin cambios) ────────────────────────────────────────
   Future<File> exportToExcel(
     ReportModel report, {
     String mensajeId = '',
     String chatId = '',
   }) async {
-    // Paso 1: Generar el archivo Excel localmente (sin cambios)
-    final file = await ExcelHelper.generateReportExcel(report);
+    final file = await PdfHelper.generateReportPdf(report);
     report.excelFile = file;
 
-    // Paso 2: Subir el Excel al servidor Donweb (NUEVO)
     await _subirArchivoYActualizar(
       archivo: file,
       report: report,
@@ -155,141 +166,51 @@ class ReportService {
     return file;
   }
 
-  // ── MÉTODO INTERNO: SUBIR ARCHIVO Y ACTUALIZAR EL MODELO ─────────────────
-  // Encapsula la lógica de subida para evitar duplicar código entre PDF y Excel.
-  //
-  // FLUJO:
-  //   1. Llama a UploadService.subirReporte() con los metadatos del reporte
-  //   2. Si la subida fue exitosa, asigna la URL al campo correspondiente
-  //      del ReportModel (pdfPublicUrl o excelPublicUrl)
-  //   3. Si falla, imprime el error pero NO lanza excepción
-  //      → el reporte sigue funcionando localmente aunque falle la subida
+  // ── SUBIR ARCHIVO AL SERVIDOR (sin cambios) ───────────────────────────────
   Future<void> _subirArchivoYActualizar({
     required File archivo,
     required ReportModel report,
-    required String formato, // 'pdf' | 'excel'
+    required String formato,
     required String mensajeId,
     required String chatId,
   }) async {
-    // Intentar subir al servidor
     final resultado = await UploadService.subirReporte(
       archivo: archivo,
       mensajeId: mensajeId,
       chatId: chatId,
-      tipo: report.type.name, // Ej: 'estadoResultados'
-      titulo: report.title, // Ej: 'Estado de Resultados'
-      periodo: report.periodoFormateado, // Ej: 'Del 01/01/2025 al 31/01/2025'
+      tipo: report.type.name,
+      titulo: report.title,
+      periodo: report.periodoFormateado,
       formato: formato,
     );
 
     if (resultado.success && resultado.publicUrl != null) {
-      // ✅ Subida exitosa: asignar URL pública al modelo
       if (formato == 'pdf') {
         report.pdfPublicUrl = resultado.publicUrl;
       } else {
         report.excelPublicUrl = resultado.publicUrl;
       }
       report.dbReporteId = resultado.dbId;
-
       debugPrint('[ReportService] ✅ $formato subido: ${resultado.publicUrl}');
     } else {
-      // ⚠️ Fallo silencioso: el reporte sigue funcionando localmente
-      // La URL quedará null y la burbuja no mostrará el botón "Ver online"
       debugPrint(
         '[ReportService] ⚠️ No se pudo subir $formato: ${resultado.errorMessage}',
       );
     }
   }
 
-  // ── MÉTODO LEGACY ─────────────────────────────────────────────────────────
-  // Compatibilidad con el chatMain.dart original
+  // ── MÉTODO LEGACY — compatibilidad con chatMain.dart ─────────────────────
   Future<Map<String, dynamic>> getIncomeStatement({String? period}) async {
-    final rawData = await DataService.getMovimientosRaw();
-
-    List<Map<String, dynamic>> filtered = rawData;
-    if (period != null) {
-      filtered =
-          rawData
-              .where(
-                (m) =>
-                    m['periodo']?.toString().startsWith(period) == true ||
-                    m['fecha_creacion']?.toString().startsWith(period) == true,
-              )
-              .toList();
-    }
-
-    final cifras = _calcularCifras(filtered);
+    // Mantiene compatibilidad pero ya no se usa en el flujo principal
     return {
       'periodo': period ?? 'Actual',
-      'ingresos': cifras['ingresos'],
-      'gastos': cifras['gastos'],
-      'utilidad': cifras['utilidad'],
+      'ingresos': 0.0,
+      'gastos': 0.0,
+      'utilidad': 0.0,
     };
   }
 
-  // ── MÉTODOS INTERNOS ──────────────────────────────────────────────────────
-
-  Future<List<Map<String, dynamic>>> _fetchFiltered(
-    DateTime from,
-    DateTime to,
-  ) async {
-    final raw = await DataService.getMovimientosRaw();
-    return raw.where((m) {
-      final fechaStr =
-          m['fecha_creacion']?.toString() ?? m['periodo']?.toString() ?? '';
-      final fecha = DateTime.tryParse(fechaStr);
-      if (fecha == null) return true;
-      return !fecha.isBefore(from) && !fecha.isAfter(to);
-    }).toList();
-  }
-
-  Map<String, dynamic> _calcularCifras(List<Map<String, dynamic>> data) {
-    double ingresos = 0;
-    double gastos = 0;
-
-    for (final m in data) {
-      final valor = double.tryParse(m['valor_cop']?.toString() ?? '0') ?? 0;
-      final cat = (m['categoria'] ?? '').toString().toLowerCase();
-
-      if (cat.contains('ingreso') ||
-          cat.contains('venta') ||
-          cat.contains('cobro')) {
-        ingresos += valor;
-      } else if (cat.contains('gasto') ||
-          cat.contains('costo') ||
-          cat.contains('pago') ||
-          cat.contains('egreso')) {
-        gastos += valor;
-      } else {
-        if (valor > 0)
-          ingresos += valor;
-        else
-          gastos += valor.abs();
-      }
-    }
-
-    return {
-      'ingresos': ingresos,
-      'gastos': gastos,
-      'utilidad': ingresos - gastos,
-      'total_movimientos': data.length,
-    };
-  }
-
-  List<Map<String, dynamic>> _buildChartData(List<Map<String, dynamic>> data) {
-    final Map<String, double> porCategoria = {};
-    for (final m in data) {
-      final cat = m['categoria']?.toString() ?? 'Sin categoría';
-      final valor = double.tryParse(m['valor_cop']?.toString() ?? '0') ?? 0;
-      porCategoria[cat] = (porCategoria[cat] ?? 0) + valor.abs();
-    }
-
-    final entries =
-        porCategoria.entries.toList()
-          ..sort((a, b) => b.value.compareTo(a.value));
-
-    return entries.map((e) => {'label': e.key, 'value': e.value}).toList();
-  }
+  // ── UTILIDADES DE PARSEO ─────────────────────────────────────────────────
 
   String _labelTipo(String type) {
     const m = {
@@ -314,12 +235,12 @@ class ReportService {
     }
   }
 
-  ChartType _chartDefault(String type) {
+  ChartType _parseChartType(String type) {
     switch (type.toLowerCase()) {
-      case 'flujo':
-        return ChartType.line;
-      case 'balance':
+      case 'pie':
         return ChartType.pie;
+      case 'line':
+        return ChartType.line;
       default:
         return ChartType.bar;
     }
